@@ -1,0 +1,1667 @@
+---
+title: "Kickstarter"
+author: "Abhijit Haridas"
+date: "12/05/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Importing Necessary Libraries
+
+
+
+```{r import libraries, echo = FALSE}
+
+# install.packages("devtools")
+# require(devtools)
+# install.packages("irlba")
+# install_version("text2vec", version = "0.5.1", repos = "http://cran.us.r-project.org")
+# install.packages("tm")
+# install.packages("SnowballC")
+# install.packages("vip")
+
+library(text2vec)
+
+
+library(splitstackshape)
+library(tidyverse)
+library(dplyr)
+library(tree)
+library(ggplot2)
+library(glmnet)
+library(e1071)
+library(randomForest)
+library(gbm)
+library(tm)
+library(SnowballC)
+library(glmnet)
+library(vip)
+library(xgboost)
+library(naivebayes)
+library(tidyr)
+library(fastDummies)
+library(lightgbm)
+
+memory.limit(10240)
+
+```
+
+## Import Kickstarter Data
+
+This Section imports kickstarter dataset.
+
+```{r import dataset, echo = FALSE, warnings=FALSE}
+
+trainxs <- read.csv("ks_training_X.csv")
+trainys <- read.csv('ks_training_y.csv')
+testxs <- read.csv('ks_test_X.csv')
+income_per_capita<-read.csv("pcap_us.csv")
+income_per_capita<-rename(income_per_capita,"State" = "ï..State")
+
+view(income_per_capita)
+trains <- trainxs %>%
+  left_join(trainys, by = "id") %>%
+  mutate(success = as.factor(success),
+         big_hit = as.factor(big_hit))
+
+
+cleans <- trains%>%
+  mutate(
+    # location_type = as.factor(location_type),
+    region = as.factor(region),
+    # category_parent = as.factor(category_parent),
+    # color_foreground = as.factor(color_foreground),
+    # color_background = as.factor(color_background),
+    # accent_color = as.factor(accent_color),
+    # captions = as.factor(captions),
+    deadline = as.Date(deadline)
+  )
+
+### Category wise Average Goal
+cleans<-cleans%>%
+  group_by(category_parent) %>% mutate(average_goal_by_cat_parent = mean(goal)) %>%ungroup()
+
+### Creator Name
+
+cleans <- cleans %>%
+  group_by(creator_name) %>%
+  mutate(count = n()) %>%
+  ungroup() %>%
+  mutate(quantile_rank = ntile(count, 4),
+         top_creator_quartile = as.factor(ifelse(quantile_rank == 1, "YES", "NO")))
+
+
+#### Top 10 Creator Names by number of projects
+##### Sort original dataframe by descending order of number of projects
+cleans_sorted <- cleans %>%
+  group_by(creator_name) %>%
+  mutate(count_creator_name = n()) %>%
+  arrange(desc(count_creator_name))
+
+##### Get names of creators of this dataframe
+top_10_creator_name_filter<-unique(cleans_sorted$creator_name)
+
+##### Remove the initally created sorted dataframe
+rm(cleans_sorted)
+
+##### Filter just top 10 names and store them in a vector
+top_10_creator_name_filter = c(head(top_10_creator_name_filter, n=10))
+
+##### Mutate original data with inclusive exclusive of top 10 filter
+cleans<-cleans%>%mutate(top10_creators_by_num_projects = ifelse(creator_name%in%top_10_creator_name_filter,"YES","NO"),
+                        top10_creators_by_num_projects = as.factor(top10_creators_by_num_projects))
+
+
+#### Top 10 Creator Names by average goal
+
+average_goal_by_creator <- cleans %>%group_by(creator_name)%>%
+  mutate (average_goal = mean(goal))%>%arrange(desc(average_goal))
+
+##### Get names of creators of this dataframe
+top_10_creator_name_filter<-unique(average_goal_by_creator$creator_name)
+
+##### Remove the initally created sorted dataframe
+rm(average_goal_by_creator)
+
+##### Filter just top 10 names and store them in a vector
+top_10_creator_name_filter = c(head(top_10_creator_name_filter, n=10))
+
+##### Mutate original data with inclusive exclusive of top 10 filter
+cleans<-cleans%>%mutate(top10_creators_by_average_goal = ifelse(creator_name%in%top_10_creator_name_filter,"YES","NO"),
+                        top10_creators_by_average_goal=as.factor(top10_creators_by_average_goal))
+
+
+
+### 2. Duration between created and launched at and Duration between launched at and deadline 
+cleans <- cleans %>%
+  mutate(created_at = as.Date(created_at),
+         launched_at = as.Date(launched_at),
+         target_duration = launched_at - created_at,
+         funding_duration = deadline - launched_at)
+
+###3. Location Slug:- Separate Name and City
+cleans <- cleans %>%
+  separate(location_slug, c("City", "State"), sep = -3) %>%
+  mutate( City = as.character(gsub("-"," ", City)),
+    State = as.character(gsub("-","",State)),
+    State = as.factor(State),
+    City = as.factor(City))
+
+
+cleans <- cleans %>%
+  left_join(income_per_capita, by = "State")
+
+###4. Location Type:- Group less frequently occuring location types
+
+cleans<-cleans%>%group_by(location_type)%>%mutate(count_location_type = n())%>%ungroup()%>% mutate(location_type = ifelse(count_location_type<500,"Other",location_type),
+                                                                                                   location_type = as.factor(location_type),
+                                                                                                   region = as.factor(region),
+                                                                                                   category_name = as.factor(category_name))
+
+###5. Category within Category Parent - Find if category is top in the parent or not
+category_name_sorted<-cleans%>%group_by(category_parent,category_name)%>%mutate(count_category_name = n())%>%arrange(desc(count_category_name))
+
+
+##### Get names of category of this dataframe
+top_10_category_name_filter<-unique(category_name_sorted$category_name)
+
+
+##### Remove the initally created sorted dataframe
+rm(category_name_sorted)
+
+##### Filter just top 10 names and store them in a vector
+top_10_category_name_filter = c(head(top_10_category_name_filter, n=10))
+
+##### Mutate original data with inclusive exclusive of top 10 filter
+cleans<-cleans%>%mutate(category_in_top_10 = ifelse(category_name%in%top_10_category_name_filter,"YES","NO"),
+                        category_in_top_10 = as.factor(category_in_top_10))
+
+###5. Female Creator> Male Creator? and Female Project>Male Project?
+cleans<-cleans%>%mutate(fem_creators_greater_than_male_creators = ifelse(female_creator>male_creator,"YES","NO"),
+                        fem_creators_greater_than_male_creators = as.factor(fem_creators_greater_than_male_creators))
+
+cleans<-cleans%>%mutate(fem_projects_greater_than_male_projects = ifelse(female_project>male_project,"YES","NO"),
+                        fem_projects_greater_than_male_projects=as.factor(fem_projects_greater_than_male_projects))
+
+
+###6. Replace all NAs in (isTextPic,...) with "Missing"
+# vectoreplace<-c("isbwImg1","isShapePic","isDiagramPic","isCalendarPic","isLogoPic","isTextPic","captions","color_foreground","color_background","accent_color")
+
+cleans$isbwImg1[is.na(cleans$isbwImg1)]<-"Missing"
+cleans$isShapePic[is.na(cleans$isShapePic)]<-"Missing"
+cleans$isDiagramPic[is.na(cleans$isDiagramPic)]<-"Missing"
+cleans$isCalendarPic[is.na(cleans$isCalendarPic)]<-"Missing"
+cleans$isTextPic[is.na(cleans$isTextPic)]<-"Missing"
+cleans$isLogoPic[is.na(cleans$isLogoPic)]<-"Missing"
+cleans$captions[is.na(cleans$captions)]<-"Missing"
+cleans$color_foreground[is.na(cleans$color_foreground)]<-"Missing"
+cleans$color_background[is.na(cleans$color_background)]<-"Missing"
+cleans$accent_color[is.na(cleans$accent_color)]<-"Missing"
+
+###7. Create Dummy Variables for Tag Names
+
+# cleans<-cSplit_e(cleans, "tag_names", "|", type = "character", fill = 0, drop = T)
+
+# Problem Encountered: Too Many Tags leading to too many columns - Cannot allocate it in a dataframe
+
+###8. affin_positive and affin_negative
+
+cleans<-cleans%>%mutate(afinn_diff = afinn_pos - afinn_neg)
+
+cleans<-cleans%>%mutate(afinn_positive_higher = ifelse(afinn_pos>afinn_neg,"YES","NO"),
+                        afinn_positive_higher = as.factor(afinn_positive_higher))
+
+
+###9. Binning Goal Variable
+
+
+# Install the required package
+# install.packages("fastDummies")
+
+
+
+cleans<-cleans %>% mutate(goal_bin = ntile(goal, n=5),
+                          goal_bin = as.factor(goal_bin))
+
+
+
+###10. Binning Minage,Maxage of creators and projects
+cleans<-cleans %>% mutate(minage_creator_bin = ntile(minage_creator, n=4),
+                          minage_creator_bin = as.factor(minage_creator_bin))
+
+cleans<-cleans %>% mutate(maxage_creator_bin = ntile(maxage_creator, n=4),
+                          maxage_creator_bin = as.factor(maxage_creator_bin))
+
+cleans<-cleans %>% mutate(minage_project_bin = ntile(minage_project, n=4),
+                          minage_project_bin = as.factor(minage_project_bin))
+
+cleans<-cleans %>% mutate(maxage_project_bin = ntile(maxage_project, n=4),
+                          maxage_project_bin = as.factor(maxage_project_bin))
+###11. Factor transformation
+cleans <- cleans%>%
+  mutate(
+    location_type = as.factor(location_type),
+    category_parent = as.factor(category_parent),
+    color_foreground = as.factor(color_foreground),
+    color_background = as.factor(color_background),
+    accent_color = as.factor(accent_color),
+    captions = as.factor(captions),
+    contains_youtube = as.factor(contains_youtube)
+  )
+
+###12. Extracting  month year from launch date
+cleans<-cleans%>%mutate(launch_month = format(launched_at, format="%m"),
+                        created_month = format(created_at, format="%m"),
+                        deadline_month = format(deadline, format="%m"),
+                        launch_year = format(deadline, format="%Y"),
+                        created_year = format(deadline, format="%Y"),
+                        deadline_year = format(deadline, format="%Y"),
+                        launch_month = as.factor(launch_month),
+                        created_month = as.factor(created_month),
+                        deadline_month = as.factor(deadline_month),
+                        launch_year = as.factor(launch_year),
+                        created_year = as.factor(created_year),
+                        deadline_year = as.factor(deadline_year))
+
+###13. Creating Top 5 states or not
+##### Sort original dataframe by descending order of number of projects
+cleans_sorted <- cleans %>%
+  group_by(State) %>%
+  mutate(count_state_wise = n()) %>%
+  arrange(desc(count_state_wise))
+
+##### Get names of creators of this dataframe
+top_10_state_wise_filter<-unique(cleans_sorted$State)
+
+##### Remove the initally created sorted dataframe
+rm(cleans_sorted)
+
+##### Filter just top 10 names and store them in a vector
+top_10_state_wise_filter = c(head(top_10_state_wise_filter, n=5))
+
+##### Mutate original data with inclusive exclusive of top 10 filter
+cleans<-cleans%>%mutate(Top_5_State = ifelse(State%in%top_10_state_wise_filter,"YES","NO"),
+                        Top_5_State = as.factor(Top_5_State))
+
+##### Reward_Amount_processing
+
+length_amounts<-sapply(strsplit(as.character(cleans$reward_amounts),","),FUN=function(x){length(x[x!="Null"])})
+average_amount<-sapply(strsplit(as.character(cleans$reward_amounts),","),FUN=function(x){mean(as.numeric(x[x!="Null"]))})
+min_amount<-sapply(strsplit(as.character(cleans$reward_amounts),","),FUN=function(x){min(as.numeric(x[x!="Null"]))})
+max_amount<-sapply(strsplit(as.character(cleans$reward_amounts),","),FUN=function(x){max(as.numeric(x[x!="Null"]))})
+median_amount<- sapply(strsplit(as.character(cleans$reward_amounts),","),FUN=function(x){median(as.numeric(x[x!="Null"]))})
+cleans<-cleans%>%mutate(reward_amount_steps = length_amounts,
+                        min_reward_amount = min_amount,
+                        max_reward_amount = max_amount,
+                        range_reward_amount = max_amount - min_amount,
+                        average_reward_amount = average_amount)
+cleans<-cleans %>%mutate(min_reward_amount = ifelse(is.na(min_reward_amount),mean(min_reward_amount,na.rm = TRUE),min_reward_amount),
+                 max_reward_amount = ifelse(is.na(max_reward_amount),mean(max_reward_amount,na.rm = TRUE),max_reward_amount),
+                 average_reward_amount = ifelse(is.na(average_reward_amount),mean(average_reward_amount,na.rm = TRUE),average_reward_amount),
+                 range_reward_amount = ifelse(is.na(range_reward_amount),mean(range_reward_amount,na.rm = TRUE),range_reward_amount)
+                                                    )
+
+#### Tag Length Processing
+length_tags<-sapply(strsplit(as.character(cleans$tag_names),"|"),FUN=function(x){length(x[x!="Null"])})
+cleans<-cleans%>%mutate(length_tags = length_tags)
+cleans<-cleans %>%mutate(length_tags = ifelse(is.na(length_tags),mean(length_tags,na.rm = TRUE),length_tags))
+
+###Reward Description Paragraph
+
+
+### Top Tags 
+
+cleans<-cleans%>%mutate((separate(cleans,col = tag_names, 
+          sep = "\\|",into = c('top_tag'),fill= 'right'))%>%
+  group_by(top_tag)%>%
+  mutate(count_top_tag = n())%>%
+  ungroup()%>%
+  mutate(istoptag = ifelse(count_top_tag>50,"YES","NO"),
+         istoptag = ifelse(is.na(istoptag),"Missing",istoptag)
+        ))
+
+cleans<-cleans%>%mutate(count_top_tag = ifelse(is.na(count_top_tag),
+                                          "Missing",count_top_tag),
+                        top_tag = ifelse(is.na(top_tag),
+                                               "Missing",top_tag),
+                        
+                          )
+  
+cleans<-cleans%>%mutate(top_tag = (ifelse(count_top_tag<100,"other",top_tag)))
+
+cleans<-cleans%>%mutate(top_tag = as.factor(top_tag))
+
+### Average Goal Per Day
+
+cleans<-cleans%>%mutate(avg_goal_per_day = goal/as.numeric(funding_duration))
+
+cleans_for_text_min<-cleans
+
+view(head(cleans,n=10))
+# ### 
+# cleans<-cleans%>%mutate(reward_para = unlist(reward_descriptions))
+
+#### Creating Dummy Variables
+
+cleans<-dummy_cols(cleans,select_columns=c("goal_bin","maxage_creator_bin","minage_project_bin","category_parent","top_tag","istoptag"),remove_selected_columns = TRUE)
+
+# names(cleans)[117] <- "category_parent_film_video"
+
+cleans<-dummy_cols(cleans,select_columns=c("category_name","region","State","location_type","Top_5_State","deadline_year","launch_month", "created_month","deadline_month","launch_year","created_year",'isbwImg1',
+'isTextPic',
+'isLogoPic',
+'isCalendarPic',
+'isDiagramPic',
+'isShapePic',
+'contains_youtube',
+'top_creator_quartile',
+'top10_creators_by_num_projects',
+'top10_creators_by_average_goal',
+'category_in_top_10',
+'fem_creators_greater_than_male_creators',
+'fem_projects_greater_than_male_projects',
+'afinn_positive_higher',
+'Top_5_State'),remove_selected_columns = TRUE)
+
+
+
+```
+
+
+# Text Mining. 
+**`This section primarily focuses on text mining project blurbs to obtain a vocabulary that can be used on the test dataset. Entirety of the training dataset blurbs are tokenized and a vocabulary is created. Below were the steps taken in creating a generalized vocabulary: 1. Stop words removed, punctuations removed, numbers removed, Each world appears atleast once in each category_parent, min count of word across the corpus  = 50.` **
+## Text Mining Blurb of Each Project
+
+```{r Text Mining Blurb of Each Project}
+
+prep_fun = tolower
+
+cleaning_tokenizer <- function(v) {
+  v %>%
+    removeNumbers %>% #remove all numbers
+    removePunctuation %>% #remove all punctuation
+    removeWords(stopwords(kind="en")) %>% #remove stopwords
+    # stemDocument %>%
+    word_tokenizer
+}
+
+tok_fun = cleaning_tokenizer
+
+category_vec<-c('art',
+'comics',
+'crafts',
+'dance',
+'design',
+'fashion',
+'film & video',
+'food',
+'games',
+'journalism',
+'music',
+'photography',
+'publishing',
+'technology',
+'theater')
+
+
+it_train = itoken(cleans_for_text_min$blurb,
+                  preprocessor = prep_fun,
+                  tokenizer = tok_fun,
+                  ids = cleans_for_text_min$id,
+                  progressbar = FALSE)
+
+stop_words<-c('i', 'me', 'my', 'myself', 'we',
+              'our', 'ours', 'ourselves', 'you', "you're",
+              "you've", "you'll", "you'd", 'your', 'yours', 'yourself',
+              'yourselves', 'he', 'him', 'his', 'himself', 'she', "she's",
+              'her', 'hers', 'herself', 'it', "it's", 'its', 'itself',
+              'they', 'them', 'their', 'theirs', 'themselves', 'what',
+              'which', 'who', 'whom', 'this', 'that', "that'll", 'these',
+              'those', 'am', 'is', 'are', 'was', 'were', 'be', 'been',
+              'being', 'have', 'has', 'had', 'having', 'do', 'does', 'did', 'doing', 'a', 'an', 'the', 'and', 'but', 'if', 'or', 'because', 'as', 'until', 'while', 'of', 'at', 'by', 'for', 'with', 'about', 'against', 'between', 'into', 'through', 'during', 'before', 'after', 'above', 'below', 'to', 'from', 'up', 'down', 'in', 'out', 'on', 'off', 'over', 'under', 'again', 'further', 'then', 'once', 'here', 'there', 'when', 'where', 'why', 'how', 'all', 'any', 'both', 'each', 'few', 'more', 'most', 'other', 'some', 'such', 'no', 'nor', 'not', 'only', 'own', 'same', 'so', 'than', 'too', 'very', 's', 't', 'can', 'will', 'just', 'don', "don't", 'should', "should've", 'now', 'd', 'll', 'm', 'o', 're', 've', 'y', 'ain', 'aren', "aren't", 'couldn', "couldn't", 'didn', "didn't", 'doesn', "doesn't", 'hadn', "hadn't", 'hasn', "hasn't", 'haven', "haven't", 'isn', "isn't", 'ma', 'mightn', "mightn't", 'mustn', "mustn't", 'needn', "needn't", 'shan', "shan't", 'shouldn', "shouldn't", 'wasn', "wasn't", 'weren', "weren't", 'won', "won't", 'wouldn', "wouldn't")
+
+
+vocab3 <- create_vocabulary(it_train, stopwords = stop_words, ngrams = c(1L,4L))
+vocab3<-prune_vocabulary(vocab3,term_count_min = 50)
+
+view(vocab3)
+
+vocab_intersect<-vocab3
+
+for (i in 1:length(category_vec)){
+  category_n = category_vec[i]
+  print(category_n)
+  ##filter projects of that category
+  cat_cleans<-cleans_for_text_min%>%filter(category_parent==category_n)
+  cat_cleans_success<-cat_cleans%>%filter(success=="YES")
+  # cat_cleans_success<-cat_cleans
+  print(dim(cat_cleans_success))
+  print(dim(vocab_intersect))
+  prep_fun = tolower
+
+  cleaning_tokenizer <- function(v) {
+    v %>%
+      removeNumbers %>% #remove all numbers
+      removePunctuation %>% #remove all punctuation
+      removeWords(stopwords(kind="en")) %>% #remove stopwords
+      # stemDocument %>%
+      word_tokenizer
+  }
+
+  tok_fun = cleaning_tokenizer
+
+
+  ##Create vocabulary
+  it_train = itoken(cat_cleans_success$blurb,
+                    preprocessor = prep_fun,
+                    tokenizer = tok_fun,
+                    ids = cat_cleans_success$id,
+                    progressbar = FALSE)
+
+  stop_words<-c('i', 'me', 'my', 'myself', 'we',
+                'our', 'ours', 'ourselves', 'you', "you're",
+                "you've", "you'll", "you'd", 'your', 'yours', 'yourself',
+                'yourselves', 'he', 'him', 'his', 'himself', 'she', "she's",
+                'her', 'hers', 'herself', 'it', "it's", 'its', 'itself',
+                'they', 'them', 'their', 'theirs', 'themselves', 'what',
+                'which', 'who', 'whom', 'this', 'that', "that'll", 'these',
+                'those', 'am', 'is', 'are', 'was', 'were', 'be', 'been',
+                'being', 'have', 'has', 'had', 'having', 'do', 'does', 'did', 'doing', 'a', 'an', 'the', 'and', 'but',
+                'if', 'or', 'because', 'as', 'until', 'while', 'of', 'at', 'by', 'for', 'with', 'about', 'against', 'between', 'into',
+                'through', 'during', 'before', 'after', 'above', 'below', 'to', 'from', 'up', 'down', 'in', 'out', 'on', 'off', 'over',
+                'under', 'again', 'further', 'then', 'once', 'here', 'there', 'when', 'where',
+                'why', 'how', 'all', 'any', 'both', 'each', 'few', 'more', 'most', 'other', 'some', 'such', 'no', 'nor', 'not', 'only', 'own',
+                'same', 'so', 'than', 'too', 'very', 's', 't', 'can', 'will', 'just', 'don', "don't", 'should', "should've", 'now', 'd', 'll',
+                'm', 'o', 're', 've', 'y', 'ain', 'aren', "aren't", 'couldn', "couldn't",
+                'didn', "didn't", 'doesn', "doesn't", 'hadn', "hadn't", 'hasn', "hasn't", 'haven', "haven't", 'isn', "isn't", 'ma', 'mightn', "mightn't",
+                'mustn', "mustn't", 'needn', "needn't", 'shan', "shan't", 'shouldn', "shouldn't", 'wasn',
+                "wasn't", 'weren', "weren't", 'won', "won't", 'wouldn', "wouldn't")
+
+
+  vocab_filtered <- create_vocabulary(it_train, stopwords = stop_words, ngrams = c(1L,4L))
+
+  ## Check Intersection and Store it Back in a single Vocabulary
+  vocab_intersect<-vocab_intersect%>%filter(term %in% vocab_filtered$term)
+
+}
+
+final_vocab= vocab3%>%filter(term %in% vocab_intersect$term)
+final_vectorizer = vocab_vectorizer(final_vocab)
+
+### Tokenizing and creating DTM for entire training set.
+it_train = itoken(cleans$blurb,
+                  preprocessor = prep_fun,
+                  tokenizer = tok_fun,
+                  ids = cleans$id,
+                  progressbar = FALSE)
+
+dtm_cleans = create_dtm(it_train, final_vectorizer)
+dim(dtm_cleans)
+
+tfidf = TfIdf$new()
+dtm_cleans_tfidf = fit_transform(dtm_cleans, tfidf)
+dim(dtm_cleans_tfidf)
+
+```
+
+
+```{r Predict using Text Features on Entire Training Data}
+
+## Running a regularized logistic regression to get predictions.
+tr_x<-dtm_cleans_tfidf
+tr_y<-ifelse(cleans$success=="YES",1,0)
+
+
+grid <- 10^seq(7,-7,length=100)
+k<-5
+cv.out.ridge <- cv.glmnet(tr_x, tr_y, family="binomial", alpha=0, lambda=grid, nfolds=k)
+
+plot(cv.out.ridge)
+bestlam_ridge <- cv.out.ridge$lambda.min
+pred_ridge <- predict(cv.out.ridge, s=bestlam_ridge, newx = tr_x,type="response")
+
+## Binding to original dataset as an added feature
+cleans<-cbind(cleans,pred_ridge)
+cleans<-rename(cleans, "numerical_pred_ridge_blurb" = "s1")
+
+```
+
+
+```{r Train Test Split for Model Creation, Evaluation and Selection}
+cleans<-rename(cleans, "category_parent_film_video"="category_name_Film  Video" )
+
+base_data1 <- cleans%>%
+  select(goal,average_goal_by_cat_parent,
+numfaces_project,
+numfaces_creator,
+male_project,
+male_creator,
+female_project,
+female_creator,
+smiling_project,
+smiling_creator,
+minage_project,
+minage_creator,
+maxage_project,
+maxage_creator,
+num_words,
+avg_wordlengths,
+sentence_counter,
+avgsentencelength,
+avgsyls,
+grade_level,
+afinn_pos,
+afinn_neg,
+ADV,
+NOUN,
+ADP,
+PRT,
+DET,
+PRON,
+VERB,
+NUM,
+CONJ,
+ADJ,
+count,
+quantile_rank,
+target_duration,
+funding_duration,
+count_location_type,
+afinn_diff,
+reward_amount_steps,
+min_reward_amount,
+max_reward_amount,
+range_reward_amount,
+average_reward_amount,
+length_tags,
+count_top_tag,
+avg_goal_per_day,
+goal_bin_1,
+goal_bin_2,
+goal_bin_3,
+goal_bin_4,
+goal_bin_5,
+maxage_creator_bin_1,
+maxage_creator_bin_2,
+maxage_creator_bin_3,
+maxage_creator_bin_4,
+minage_project_bin_1,
+minage_project_bin_2,
+minage_project_bin_3,
+minage_project_bin_4,
+category_parent_art,
+category_parent_comics,
+category_parent_crafts,
+category_parent_dance,
+category_parent_design,
+category_parent_fashion,
+category_parent_film_video,
+category_parent_food,
+category_parent_games,
+category_parent_journalism,
+category_parent_music,
+category_parent_photography,
+category_parent_publishing,
+category_parent_technology,
+category_parent_theater,
+top_tag_cartoon,
+top_tag_design,
+top_tag_drawing,
+top_tag_food,
+top_tag_grass,
+top_tag_indoor,
+top_tag_Missing,
+top_tag_other,
+top_tag_outdoor,
+top_tag_person,
+top_tag_screenshot,
+top_tag_sketch,
+top_tag_sky,
+top_tag_text,
+top_tag_tree,
+istoptag_NO,
+istoptag_YES,
+region_ENCentral,
+region_ESCentral,
+region_MidAtl,
+region_Mountain,
+region_NewEng,
+region_Pacific,
+region_SouthAtl,
+region_WNCentral,
+region_WSCentral,
+State_ak,
+State_al,
+State_ar,
+State_az,
+State_ca,
+State_co,
+State_ct,
+State_dc,
+State_de,
+State_fl,
+State_ga,
+State_hi,
+State_ia,
+State_id,
+State_il,
+State_in,
+State_ks,
+State_ky,
+State_la,
+State_ma,
+State_md,
+State_me,
+State_mi,
+State_mn,
+State_mo,
+State_ms,
+State_mt,
+State_nc,
+State_nd,
+State_ne,
+State_nh,
+State_nj,
+State_nm,
+State_nv,
+State_ny,
+State_oh,
+State_ok,
+State_one,
+State_or,
+State_pa,
+State_ri,
+State_sc,
+State_sd,
+State_tn,
+State_tx,
+State_us,
+State_ut,
+State_va,
+State_vt,
+State_wa,
+State_wi,
+State_wv,
+State_wy,
+location_type_Other,
+location_type_Town,
+Top_5_State_NO,
+Top_5_State_YES,
+deadline_year_2014,
+launch_month_07,
+launch_month_08,
+launch_month_09,
+launch_month_10,
+launch_month_11,
+created_month_01,
+created_month_02,
+created_month_03,
+created_month_04,
+created_month_05,
+created_month_06,
+created_month_07,
+created_month_08,
+created_month_09,
+created_month_10,
+created_month_11,
+created_month_12,
+deadline_month_09,
+deadline_month_10,
+deadline_month_11,
+deadline_month_12,
+launch_year_2014,
+created_year_2014,
+isbwImg1_FALSE,
+isbwImg1_Missing,
+isbwImg1_TRUE,
+isTextPic_0,
+isTextPic_1,
+isTextPic_Missing,
+isLogoPic_0,
+isLogoPic_1,
+isLogoPic_Missing,
+isCalendarPic_0,
+isCalendarPic_1,
+isCalendarPic_Missing,
+isDiagramPic_0,
+isDiagramPic_1,
+isDiagramPic_Missing,
+isShapePic_0,
+isShapePic_1,
+isShapePic_Missing,
+contains_youtube_0,
+contains_youtube_1,
+top_creator_quartile_NO,
+top_creator_quartile_YES,
+top10_creators_by_num_projects_NO,
+top10_creators_by_num_projects_YES,
+top10_creators_by_average_goal_NO,
+top10_creators_by_average_goal_YES,
+category_in_top_10_NO,
+category_in_top_10_YES,
+fem_creators_greater_than_male_creators_NO,
+fem_creators_greater_than_male_creators_YES,
+fem_projects_greater_than_male_projects_NO,
+fem_projects_greater_than_male_projects_YES,
+afinn_positive_higher_NO,
+afinn_positive_higher_YES,
+numerical_pred_ridge_blurb,
+success
+  )
+
+train_withterms <- base_data1
+
+set.seed(1)
+
+tr_inds <- sample(nrow(train_withterms), 0.7*nrow(train_withterms))
+train_withterms<-rename(train_withterms, funding_goal = goal)
+
+train_withterms<- train_withterms%>%mutate(funding_duration = as.numeric(funding_duration),
+target_duration = as.numeric(target_duration))
+
+train_withterms$success <- ifelse(train_withterms$success=="YES",1,0)
+
+tr <- train_withterms[tr_inds,]
+va <- train_withterms[-tr_inds,]
+```
+
+
+```{r Create Models: Model 1 Regularized Logistic Regression}
+
+##2. Regularized Logistic Regression
+# 
+# log1 <- glm(success~., data = tr, family = "binomial")
+# probs_success <- predict(log1, newdata = va, type = "response")
+# 
+# classifications <- ifelse(probs_success > .5, "YES", "NO")
+# correct <- ifelse(classifications == va$success, 1, 0)
+# acc <- sum(correct)/length(correct)
+# 
+# #### Regularized Logistic Regression
+base_data1_x <- model.matrix(success~.,base_data1)
+base_data1_y <- base_data1$success
+
+##### Train Test Split
+train <- sample(nrow(base_data1),.7*nrow(base_data1))
+x_train <- base_data1_x[train,]
+x_valid <- base_data1_x[-train,]
+
+y_train <- base_data1_y[train]
+y_valid <- base_data1_y[-train]
+# 
+# #family="binomial" yields logistic regression; family="gaussian" yields linear regression
+# #alpha = 1 yields the lasso penalty, and alpha = 0 the ridge penalty
+# #basic, default
+# glm.out.ridge <- glmnet(x_train, y_train, alpha = 0, family="binomial")
+# # glm.out.lasso <- glmnet(x_train, y_train, alpha = 1, family="binomial")
+# # 
+# # #shows coefficient values vs. lambda
+# plot(glm.out.ridge, xvar = "lambda")
+# # plot(glm.out.lasso, xvar = "lambda")
+
+#Hyperparameter Tuning using Grid Search and Cross Validation for Logistic Regression
+grid <- 10^seq(10,-10,length=100)
+grid
+
+#glmnet automatically does cross-validation for you, you just need to specify k. Let's try k=5.
+k<-5
+
+#family="binomial" yields logistic regression; family="gaussian" yields linear regression
+#alpha = 1 yields the lasso penalty, and alpha= 0 the ridge penalty
+cv.out <- cv.glmnet(x_train, y_train, family="binomial", alpha=0, lambda=grid, nfolds=k)
+# plot(cv.out)
+
+
+#get the lambda that gave the lowest cross-validated error
+bestlam <- cv.out$lambda.min
+coeffs <- coef(cv.out, s = "lambda.min")
+# coeffs
+
+#you have to add type="response" to get probabilities for logistic regression
+pred <- predict(cv.out, s=bestlam, newx = x_valid,type="response")
+
+#you can also plot a fitting curve
+lambdas <- cv.out$lambda
+errors <- cv.out$cvm
+
+# plot(lambdas, errors)
+pred_class <- ifelse(pred>.5,1,0)
+pred_acc <- mean(ifelse(pred_class==ifelse(va$success=="YES",1,0),1,0))
+pred_acc
+#with this particular set of lambdas, you can see the curve easier if you plot them on a log-log scale
+plot(log(lambdas), errors)
+
+
+
+```
+
+
+```{r Create Models: Model 2 GBM}
+##1. GBM
+
+boost.mod <- gbm(success~.,data=tr,
+                 distribution="bernoulli",
+                 n.trees=750,
+                interaction.depth = 4,
+                shrinkage = 0.1,
+                )
+
+boost_preds <- predict(boost.mod,newdata=va,type='response',n.trees=750)
+
+#classify with a cutoff and compute accuracy
+boost_class <- ifelse(boost_preds>.5,1,0)
+boost_acc <- mean(ifelse(boost_class==va$success,1,0))
+boost_acc
+summary.gbm(boost.mod)
+
+### Hyperparameter Tuning
+
+
+# # Cross Validation and Hyperparameter Tuning
+# grid_search <- function(){
+# 
+#  
+#   # depth_choose <- c(2, 5, 10, 20, 50, 100,250,500,1000)
+#   depth_choose <- c(2,3,4)
+#   ntrees_choose <- c(500,750,1000,1250,1500)
+#   eta_choose <- c(0.01,0.02,0.03,0.04,0.05,0.06,0.07,0.08,0.09,0.1)
+# 
+#   #nested loops to tune these three parameters
+#   print('depth, ntrees, eta, accuracy')
+#   for(i in c(1:length(depth_choose))){
+#     for(j in c(1:length(ntrees_choose))){
+#       for(k in c(1:length(eta_choose))){
+#         thisdepth <- depth_choose[i]
+#         thisntrees <- ntrees_choose[j]
+#         thiseta <- eta_choose[k]
+# 
+#         boost.mod <- gbm(success~.,data=tr,
+#                          distribution="bernoulli",
+#                          n.trees=thisntrees,
+#                          interaction.depth = thisdepth,
+#                          shrinkage = thiseta,
+#                          cv.folds = 3,
+#                          verbose = TRUE,
+#                          class.stratify.cv = TRUE,
+#                          n.cores = NULL)
+# 
+#         boost_preds <- predict(boost.mod,newdata=va,type='response',n.trees=1000)
+# 
+#         #classify with a cutoff and compute accuracy
+#         boost_class <- ifelse(boost_preds>.5,1,0)
+#         boost_acc <- mean(ifelse(boost_class==va$success,1,0))
+# 
+# 
+#         #print the performance for every combination
+#         print(paste(thisdepth, thisnrounds, thiseta, boost_acc, sep = ", "))
+# 
+#       }
+#     }
+#   }
+# }
+# grid_search()
+
+
+
+```
+
+
+```{r Create Models: Model 3 RF}
+# rf.mod <- randomForest(success~.,
+#                        data=base_data1,
+#                        subset=tr_inds,
+#                        mtry=15, ntree=850,
+#                        importance=TRUE)
+
+
+# 
+# 
+# 
+# importance_vars<-importance(rf.mod)
+# view(importance_vars)
+# rf_preds <- predict(rf.mod, newdata=va)
+# 
+# rf_acc <- mean(ifelse(rf_preds==va$success,1,0))
+# rf_acc
+
+
+```
+# ###Iteration Log for RF
+
+# ####1. 25 minutes to train 70% of big dataset mtry = 4, ntree = 1000
+# ####2. 25 minutes to train 70% of big dataset mtry = 4, ntree = 700
+
+
+```{r Create Models: Model 4 XGBoost}
+tr_x<-tr[,-217]
+va_x<-va[,-217]
+
+tr_y<-tr$success
+va_y<-va$success
+
+boost_train_matrix <- data.matrix(sapply(tr_x, as.numeric))
+boost_valid_matrix <- data.matrix(sapply(va_x, as.numeric))
+
+# bst <- xgboost(data = boost_train_matrix, label = tr_y, max.depth = 4, eta = 0.1, nrounds = 700,  objective = "binary:logistic")
+# 
+# 
+# bst_pred <- predict(bst, boost_valid_matrix)
+# bst_classifications <- ifelse(bst_pred > 0.5, 1, 0)
+# bst_acc <- mean(ifelse(bst_classifications == va_y, 1, 0))
+# bst_acc
+# 
+# vip(bst,num_features = 40)
+
+#Hyper Parameter Tuning
+
+grid_search <- function(){
+
+  #three hyperparameters can possibly really change predictive performance of xgboost (although maybe not)
+  # depth_choose <- c(2, 5, 10, 20, 50, 100,250,500,1000)
+  depth_choose <- c(3,4,5,7)
+  nrounds_choose <- c( 200,250,400,500,700,750,900,1000,1500)
+  eta_choose <- c(0.05,0.15,0.25,0.35,0.5,0.65,0.8,0.85,0.9,0.95)
+  accuracy<-vector(10)
+
+  #nested loops to tune these three parameters
+  print('depth, nrounds, eta, accuracy')
+
+      for(k in c(1:length(eta_choose))){
+        thisdepth <- 6
+        thisnrounds <- 700
+        thiseta <- eta_choose[k]
+
+        inner_bst <- xgboost(data = boost_train_matrix, label = tr_y, max.depth = thisdepth, eta = thiseta, nrounds = thisnrounds,  objective = "binary:logistic", verbosity = 0, verbose = 0)
+
+        inner_bst_pred <- predict(inner_bst, boost_valid_matrix)
+        inner_bst_classifications <- ifelse(inner_bst_pred > 0.5, 1, 0)
+        inner_bst_acc <- mean(ifelse(inner_bst_classifications == va_y, 1, 0))
+
+        #print the performance for every combination
+        print(paste(thisdepth, thisnrounds, thiseta, inner_bst_acc, sep = ", "))
+
+      }
+  
+}
+    
+grid_search()
+ggsave("plot_xg_boost.jpg",plot(eta_choose,inner_bst_acc))
+
+```
+
+
+```{r Create Models: Model 5 Catboost}
+#### Catboost
+library(catboost)
+
+## X Values
+
+# tr$top_tag = as.factor(tr$top_tag)
+# va$top_tag = as.factor(va$top_tag)
+
+X_train<-tr[,-217]
+X_valid<-va[,-217]
+
+X_train <- as.matrix(sapply(X_train, as.numeric))
+X_valid <- as.matrix(sapply(X_valid, as.numeric))
+
+##Y Values
+# y_train<-ifelse(tr[,38]=="YES",1,0)
+y_train<-tr[,217]
+# y_valid<-ifelse(va[,38]=="YES",1,0)
+y_valid<-va[,217]
+
+train_pool <- catboost.load_pool(data = X_train, label = y_train)
+test_pool <- catboost.load_pool(data = X_valid, label = y_valid)
+#  
+# 
+# learning_rates<-c(0.06,0.07,0.08,0.09,0.1,0.11,0.12)
+# iterations<-c(1250)
+# depth<-c(4,5,6,7)
+# 
+# for(i in (1:length(iterations)))
+#   {
+#     for (j in (1:length(learning_rates)))
+#       {
+#         for (k in (1:length(depth)))
+#         {
+#                   lr<-learning_rates[j]
+#                   it<-iterations[i]
+#                   dp<-depth[k]
+#                    print(it)
+#                   print(lr)
+#                   print(dp)
+#                   params <- list(iterations=it,
+#                                 learning_rate=lr,
+#                                 depth=dp,
+#                                 loss_function='Logloss',
+#                                 eval_metric='Accuracy',
+#                                 random_seed = 55,
+#                                 od_type='Iter',
+#                                 metric_period = 50,
+#                                 od_wait=20,
+#                                 use_best_model=TRUE,
+#                                 boosting_type = "Ordered")
+#                 model <- catboost.train(train_pool, test_pool, params)
+# 
+#                 
+#         }
+#       }
+#     }
+
+
+# ## Single Model for Feature Importances
+
+params <- list(iterations=2200,
+               learning_rate=0.03,
+               depth=6,
+               loss_function='Logloss',
+               eval_metric='Accuracy',
+               random_seed = 42,
+               metric_period = 50,
+               od_type = "Iter",
+               use_best_model=TRUE,
+               boosting_type = "Ordered"
+               )
+
+model <- catboost.train(train_pool, test_pool, params)
+catboost.get_feature_importance(model,
+                                pool = NULL,
+                                type = 'FeatureImportance',
+                                thread_count = -1)
+
+
+```
+
+
+```{r Create Models: Model 6 Light GBM}
+tr_x<-tr[,-217]
+va_x<-va[,-217]
+
+tr_y<-tr$success
+va_y<-va$success
+
+boost_train_matrix <- data.matrix(sapply(tr_x, as.numeric))
+boost_valid_matrix <- data.matrix(sapply(va_x, as.numeric))
+
+lgb.grid = list(objective = "binary",
+                metric = "auc",
+                min_sum_hessian_in_leaf = 1,
+                feature_fraction = 0.7,
+                bagging_fraction = 0.7,
+                bagging_freq = 5,
+                min_data = 100,
+                max_bin = 50,
+                lambda_l1 = 8,
+                lambda_l2 = 1.3,
+                min_data_in_bin=100,
+                min_gain_to_split = 10,
+                min_data_in_leaf = 30,
+                is_unbalance = TRUE)
+
+#Fitting the model
+lgb.model = lgb.train(params = lgb.grid, data = boost_train_matrix, learning_rate = 0.02,
+                      num_leaves = 25, num_threads = 2 , nrounds = best.iter,
+                      eval_freq = 20,
+                      categorical_feature = categoricals.vec)
+
+lgb_preds <- predict(lgb.model,boost_valid_matrix)
+lgb_classifications <- ifelse(lgb_pred > 0.5, 1, 0)
+lgb_acc <- mean(ifelse(lgb_classifications == va_y, 1, 0))
+lgb_acc
+```
+
+
+## Deployment on Test Set
+
+```{r Feature Engineering of Test Data, echo = FALSE}
+trains<-testxs
+
+cleans <- trains%>%
+  mutate(
+    # location_type = as.factor(location_type),
+    region = as.factor(region),
+    # category_parent = as.factor(category_parent),
+    # color_foreground = as.factor(color_foreground),
+    # color_background = as.factor(color_background),
+    # accent_color = as.factor(accent_color),
+    # captions = as.factor(captions),
+    deadline = as.Date(deadline)
+  )
+
+### Category wise Average Goal
+cleans<-cleans%>%
+  group_by(category_parent) %>% mutate(average_goal_by_cat_parent = mean(goal)) %>%ungroup()
+
+cleans <- cleans %>%
+  group_by(creator_name) %>%
+  mutate(count = n()) %>%
+  ungroup() %>%
+  mutate(quantile_rank = ntile(count, 4),
+         top_creator_quartile = as.factor(ifelse(quantile_rank == 1, "YES", "NO")))
+
+
+#### Top 10 Creator Names by number of projects
+##### Sort original dataframe by descending order of number of projects
+cleans_sorted <- cleans %>%
+  group_by(creator_name) %>%
+  mutate(count_creator_name = n()) %>%
+  arrange(desc(count_creator_name))
+
+##### Get names of creators of this dataframe
+top_10_creator_name_filter<-unique(cleans_sorted$creator_name)
+
+##### Remove the initally created sorted dataframe
+rm(cleans_sorted)
+
+##### Filter just top 10 names and store them in a vector
+top_10_creator_name_filter = c(head(top_10_creator_name_filter, n=10))
+
+##### Mutate original data with inclusive exclusive of top 10 filter
+cleans<-cleans%>%mutate(top10_creators_by_num_projects = ifelse(creator_name%in%top_10_creator_name_filter,"YES","NO"),
+                        top10_creators_by_num_projects = as.factor(top10_creators_by_num_projects))
+
+
+#### Top 10 Creator Names by average goal
+
+average_goal_by_creator <- cleans %>%group_by(creator_name)%>%
+  mutate (average_goal = mean(goal))%>%arrange(desc(average_goal))
+
+##### Get names of creators of this dataframe
+top_10_creator_name_filter<-unique(average_goal_by_creator$creator_name)
+
+##### Remove the initally created sorted dataframe
+rm(average_goal_by_creator)
+
+##### Filter just top 10 names and store them in a vector
+top_10_creator_name_filter = c(head(top_10_creator_name_filter, n=10))
+
+##### Mutate original data with inclusive exclusive of top 10 filter
+cleans<-cleans%>%mutate(top10_creators_by_average_goal = ifelse(creator_name%in%top_10_creator_name_filter,"YES","NO"),
+                        top10_creators_by_average_goal=as.factor(top10_creators_by_average_goal))
+
+
+
+### 2. Duration between created and launched at and Duration between launched at and deadline 
+cleans <- cleans %>%
+  mutate(created_at = as.Date(created_at),
+         launched_at = as.Date(launched_at),
+         target_duration = launched_at - created_at,
+         funding_duration = deadline - launched_at)
+
+###3. Location Slug:- Separate Name and City
+cleans <- cleans %>%
+  separate(location_slug, c("City", "State"), sep = -3) %>%
+  mutate( City = as.character(gsub("-"," ", City)),
+    State = as.character(gsub("-","",State)),
+    State = as.factor(State),
+    City = as.factor(City))
+    # State = as.factor(State))
+
+cleans <- cleans %>%
+  left_join(income_per_capita, by = "State")
+
+###4. Location Type:- Group less frequently occuring location types
+
+cleans<-cleans%>%group_by(location_type)%>%mutate(count_location_type = n())%>%ungroup()%>% mutate(location_type = ifelse(count_location_type<500,"Other",location_type),
+                                                                                                   location_type = as.factor(location_type),
+                                                                                                   region = as.factor(region),
+                                                                                                   category_name = as.factor(category_name))
+
+###5. Category within Category Parent - Find if category is top in the parent or not
+category_name_sorted<-cleans%>%group_by(category_parent,category_name)%>%mutate(count_category_name = n())%>%arrange(desc(count_category_name))
+
+
+##### Get names of category of this dataframe
+top_10_category_name_filter<-unique(category_name_sorted$category_name)
+
+
+##### Remove the initally created sorted dataframe
+rm(category_name_sorted)
+
+##### Filter just top 10 names and store them in a vector
+top_10_category_name_filter = c(head(top_10_category_name_filter, n=10))
+
+##### Mutate original data with inclusive exclusive of top 10 filter
+cleans<-cleans%>%mutate(category_in_top_10 = ifelse(category_name%in%top_10_category_name_filter,"YES","NO"),
+                        category_in_top_10 = as.factor(category_in_top_10))
+
+###5. Female Creator> Male Creator? and Female Project>Male Project?
+cleans<-cleans%>%mutate(fem_creators_greater_than_male_creators = ifelse(female_creator>male_creator,"YES","NO"),
+                        fem_creators_greater_than_male_creators = as.factor(fem_creators_greater_than_male_creators))
+
+cleans<-cleans%>%mutate(fem_projects_greater_than_male_projects = ifelse(female_project>male_project,"YES","NO"),
+                        fem_projects_greater_than_male_projects=as.factor(fem_projects_greater_than_male_projects))
+
+
+###6. Replace all NAs in (isTextPic,...) with "Missing"
+# vectoreplace<-c("isbwImg1","isShapePic","isDiagramPic","isCalendarPic","isLogoPic","isTextPic","captions","color_foreground","color_background","accent_color")
+
+cleans$isbwImg1[is.na(cleans$isbwImg1)]<-"Missing"
+cleans$isShapePic[is.na(cleans$isShapePic)]<-"Missing"
+cleans$isDiagramPic[is.na(cleans$isDiagramPic)]<-"Missing"
+cleans$isCalendarPic[is.na(cleans$isCalendarPic)]<-"Missing"
+cleans$isTextPic[is.na(cleans$isTextPic)]<-"Missing"
+cleans$isLogoPic[is.na(cleans$isLogoPic)]<-"Missing"
+cleans$captions[is.na(cleans$captions)]<-"Missing"
+cleans$color_foreground[is.na(cleans$color_foreground)]<-"Missing"
+cleans$color_background[is.na(cleans$color_background)]<-"Missing"
+cleans$accent_color[is.na(cleans$accent_color)]<-"Missing"
+
+###7. Create Dummy Variables for Tag Names
+
+# cleans<-cSplit_e(cleans, "tag_names", "|", type = "character", fill = 0, drop = T)
+
+# Problem Encountered: Too Many Tags leading to too many columns - Cannot allocate it in a dataframe
+
+###8. affin_positive and affin_negative
+
+cleans<-cleans%>%mutate(afinn_diff = afinn_pos - afinn_neg)
+
+cleans<-cleans%>%mutate(afinn_positive_higher = ifelse(afinn_pos>afinn_neg,"YES","NO"),
+                        afinn_positive_higher = as.factor(afinn_positive_higher))
+
+
+###9. Binning Goal Variable
+
+
+# Install the required package
+# install.packages("fastDummies")
+
+
+
+cleans<-cleans %>% mutate(goal_bin = ntile(goal, n=5),
+                          goal_bin = as.factor(goal_bin))
+
+
+
+###10. Binning Minage,Maxage of creators and projects
+cleans<-cleans %>% mutate(minage_creator_bin = ntile(minage_creator, n=4),
+                          minage_creator_bin = as.factor(minage_creator_bin))
+
+cleans<-cleans %>% mutate(maxage_creator_bin = ntile(maxage_creator, n=4),
+                          maxage_creator_bin = as.factor(maxage_creator_bin))
+
+cleans<-cleans %>% mutate(minage_project_bin = ntile(minage_project, n=4),
+                          minage_project_bin = as.factor(minage_project_bin))
+
+cleans<-cleans %>% mutate(maxage_project_bin = ntile(maxage_project, n=4),
+                          maxage_project_bin = as.factor(maxage_project_bin))
+###11. Factor transformation
+cleans <- cleans%>%
+  mutate(
+    location_type = as.factor(location_type),
+    category_parent = as.factor(category_parent),
+    color_foreground = as.factor(color_foreground),
+    color_background = as.factor(color_background),
+    accent_color = as.factor(accent_color),
+    captions = as.factor(captions),
+    contains_youtube = as.factor(contains_youtube)
+  )
+
+###12. Extracting  month year from launch date
+cleans<-cleans%>%mutate(launch_month = format(launched_at, format="%m"),
+                        created_month = format(created_at, format="%m"),
+                        deadline_month = format(deadline, format="%m"),
+                        launch_year = format(deadline, format="%Y"),
+                        created_year = format(deadline, format="%Y"),
+                        deadline_year = format(deadline, format="%Y"),
+                        launch_month = as.factor(launch_month),
+                        created_month = as.factor(created_month),
+                        deadline_month = as.factor(deadline_month),
+                        launch_year = as.factor(launch_year),
+                        created_year = as.factor(created_year),
+                        deadline_year = as.factor(deadline_year))
+
+###13. Creating Top 5 states or not
+##### Sort original dataframe by descending order of number of projects
+cleans_sorted <- cleans %>%
+  group_by(State) %>%
+  mutate(count_state_wise = n()) %>%
+  arrange(desc(count_state_wise))
+
+##### Get names of creators of this dataframe
+top_10_state_wise_filter<-unique(cleans_sorted$State)
+
+##### Remove the initally created sorted dataframe
+rm(cleans_sorted)
+
+##### Filter just top 10 names and store them in a vector
+top_10_state_wise_filter = c(head(top_10_state_wise_filter, n=5))
+
+##### Mutate original data with inclusive exclusive of top 10 filter
+cleans<-cleans%>%mutate(Top_5_State = ifelse(State%in%top_10_state_wise_filter,"YES","NO"),
+                        Top_5_State = as.factor(Top_5_State))
+
+##### Reward_Amount_processing
+
+length_amounts<-sapply(strsplit(as.character(cleans$reward_amounts),","),FUN=function(x){length(x[x!="Null"])})
+average_amount<-sapply(strsplit(as.character(cleans$reward_amounts),","),FUN=function(x){mean(as.numeric(x[x!="Null"]))})
+min_amount<-sapply(strsplit(as.character(cleans$reward_amounts),","),FUN=function(x){min(as.numeric(x[x!="Null"]))})
+max_amount<-sapply(strsplit(as.character(cleans$reward_amounts),","),FUN=function(x){max(as.numeric(x[x!="Null"]))})
+median_amount<- sapply(strsplit(as.character(cleans$reward_amounts),","),FUN=function(x){median(as.numeric(x[x!="Null"]))})
+cleans<-cleans%>%mutate(reward_amount_steps = length_amounts,
+                        min_reward_amount = min_amount,
+                        max_reward_amount = max_amount,
+                        range_reward_amount = max_amount - min_amount,
+                        average_reward_amount = average_amount)
+cleans<-cleans %>%mutate(min_reward_amount = ifelse(is.na(min_reward_amount),mean(min_reward_amount,na.rm = TRUE),min_reward_amount),
+                 max_reward_amount = ifelse(is.na(max_reward_amount),mean(max_reward_amount,na.rm = TRUE),max_reward_amount),
+                 average_reward_amount = ifelse(is.na(average_reward_amount),mean(average_reward_amount,na.rm = TRUE),average_reward_amount),
+                 range_reward_amount = ifelse(is.na(range_reward_amount),mean(range_reward_amount,na.rm = TRUE),range_reward_amount)
+                                                    )
+
+#### Tag Length Processing
+length_tags<-sapply(strsplit(as.character(cleans$tag_names),"|"),FUN=function(x){length(x[x!="Null"])})
+cleans<-cleans%>%mutate(length_tags = length_tags)
+cleans<-cleans %>%mutate(length_tags = ifelse(is.na(length_tags),mean(length_tags,na.rm = TRUE),length_tags))
+
+### Top Tags 
+
+cleans<-cleans%>%mutate((separate(cleans,col = tag_names, 
+          sep = "\\|",into = c('top_tag'),fill= 'right'))%>%
+  group_by(top_tag)%>%
+  mutate(count_top_tag = n())%>%
+  ungroup()%>%
+  mutate(istoptag = ifelse(count_top_tag>50,"YES","NO"),
+         istoptag = ifelse(is.na(istoptag),"Missing",istoptag)
+        ))
+
+cleans<-cleans%>%mutate(count_top_tag = ifelse(is.na(count_top_tag),
+                                          "Missing",count_top_tag),
+                        top_tag = ifelse(is.na(top_tag),
+                                               "Missing",top_tag),
+                        
+                          )
+  
+cleans<-cleans%>%mutate(top_tag = (ifelse(count_top_tag<100,"other",top_tag)))
+
+cleans<-cleans%>%mutate(top_tag = as.factor(top_tag))
+
+### Average Goal Per Day
+
+cleans<-cleans%>%mutate(avg_goal_per_day = goal/as.numeric(funding_duration))
+#### Creating Dummy Variables
+
+cleans<-dummy_cols(cleans,select_columns=c("goal_bin","maxage_creator_bin","minage_project_bin","category_parent","top_tag","istoptag"),remove_selected_columns = TRUE)
+
+# names(cleans)[117] <- "category_parent_film_video"
+
+cleans<-dummy_cols(cleans,select_columns=c("category_name","region","State","location_type","Top_5_State","deadline_year","launch_month", "created_month","deadline_month","launch_year","created_year",'isbwImg1',
+'isTextPic',
+'isLogoPic',
+'isCalendarPic',
+'isDiagramPic',
+'isShapePic',
+'contains_youtube',
+'top_creator_quartile',
+'top10_creators_by_num_projects',
+'top10_creators_by_average_goal',
+'category_in_top_10',
+'fem_creators_greater_than_male_creators',
+'fem_projects_greater_than_male_projects',
+'afinn_positive_higher',
+'Top_5_State'),remove_selected_columns = TRUE)
+
+##Tokenizing test and creating dtm
+it_train = itoken(cleans$blurb,
+                  preprocessor = prep_fun,
+                  tokenizer = tok_fun,
+                  ids = cleans$id,
+                  progressbar = FALSE)
+
+
+dtm_cleans = create_dtm(it_train, final_vectorizer)
+dim(dtm_cleans)
+
+tfidf = TfIdf$new()
+dtm_cleans_tfidf = fit_transform(dtm_cleans, tfidf)
+
+###Predicting blurb ridge predictions
+
+pred_ridge <- predict(cv.out.ridge, s=bestlam_ridge, newx = dtm_cleans_tfidf,type="response")
+class_ridge<-ifelse(pred_ridge>0.5,1,0)
+
+cleans<-cbind(cleans,pred_ridge)
+cleans<-rename(cleans, "numerical_pred_ridge_blurb" = "s1")
+cleans<-cbind(cleans,class_ridge)
+
+cleans<-subset(cleans,select = -c(s1))
+
+cleans<-rename(cleans, "category_parent_film_video"="category_name_Film  Video")
+
+base_data2 <- cleans%>%
+  select(goal,average_goal_by_cat_parent,
+numfaces_project,
+numfaces_creator,
+male_project,
+male_creator,
+female_project,
+female_creator,
+smiling_project,
+smiling_creator,
+minage_project,
+minage_creator,
+maxage_project,
+maxage_creator,
+num_words,
+avg_wordlengths,
+sentence_counter,
+avgsentencelength,
+avgsyls,
+grade_level,
+afinn_pos,
+afinn_neg,
+ADV,
+NOUN,
+ADP,
+PRT,
+DET,
+PRON,
+VERB,
+NUM,
+CONJ,
+ADJ,
+count,
+quantile_rank,
+target_duration,
+funding_duration,
+count_location_type,
+afinn_diff,
+reward_amount_steps,
+min_reward_amount,
+max_reward_amount,
+range_reward_amount,
+average_reward_amount,
+length_tags,
+count_top_tag,
+avg_goal_per_day,
+goal_bin_1,
+goal_bin_2,
+goal_bin_3,
+goal_bin_4,
+goal_bin_5,
+maxage_creator_bin_1,
+maxage_creator_bin_2,
+maxage_creator_bin_3,
+maxage_creator_bin_4,
+minage_project_bin_1,
+minage_project_bin_2,
+minage_project_bin_3,
+minage_project_bin_4,
+category_parent_art,
+category_parent_comics,
+category_parent_crafts,
+category_parent_dance,
+category_parent_design,
+category_parent_fashion,
+category_parent_film_video,
+category_parent_food,
+category_parent_games,
+category_parent_journalism,
+category_parent_music,
+category_parent_photography,
+category_parent_publishing,
+category_parent_technology,
+category_parent_theater,
+top_tag_cartoon,
+top_tag_design,
+top_tag_drawing,
+top_tag_food,
+top_tag_grass,
+top_tag_indoor,
+top_tag_Missing,
+top_tag_other,
+top_tag_outdoor,
+top_tag_person,
+top_tag_screenshot,
+top_tag_sketch,
+top_tag_sky,
+top_tag_text,
+top_tag_tree,
+istoptag_NO,
+istoptag_YES,
+region_ENCentral,
+region_ESCentral,
+region_MidAtl,
+region_Mountain,
+region_NewEng,
+region_Pacific,
+region_SouthAtl,
+region_WNCentral,
+region_WSCentral,
+State_ak,
+State_al,
+State_ar,
+State_az,
+State_ca,
+State_co,
+State_ct,
+State_dc,
+State_de,
+State_fl,
+State_ga,
+State_hi,
+State_ia,
+State_id,
+State_il,
+State_in,
+State_ks,
+State_ky,
+State_la,
+State_ma,
+State_md,
+State_me,
+State_mi,
+State_mn,
+State_mo,
+State_ms,
+State_mt,
+State_nc,
+State_nd,
+State_ne,
+State_nh,
+State_nj,
+State_nm,
+State_nv,
+State_ny,
+State_oh,
+State_ok,
+State_one,
+State_or,
+State_pa,
+State_ri,
+State_sc,
+State_sd,
+State_tn,
+State_tx,
+State_us,
+State_ut,
+State_va,
+State_vt,
+State_wa,
+State_wi,
+State_wv,
+State_wy,
+location_type_Other,
+location_type_Town,
+Top_5_State_NO,
+Top_5_State_YES,
+deadline_year_2014,
+launch_month_07,
+launch_month_08,
+launch_month_09,
+launch_month_10,
+launch_month_11,
+created_month_01,
+created_month_02,
+created_month_03,
+created_month_04,
+created_month_05,
+created_month_06,
+created_month_07,
+created_month_08,
+created_month_09,
+created_month_10,
+created_month_11,
+created_month_12,
+deadline_month_09,
+deadline_month_10,
+deadline_month_11,
+deadline_month_12,
+launch_year_2014,
+created_year_2014,
+isbwImg1_FALSE,
+isbwImg1_Missing,
+isbwImg1_TRUE,
+isTextPic_0,
+isTextPic_1,
+isTextPic_Missing,
+isLogoPic_0,
+isLogoPic_1,
+isLogoPic_Missing,
+isCalendarPic_0,
+isCalendarPic_1,
+isCalendarPic_Missing,
+isDiagramPic_0,
+isDiagramPic_1,
+isDiagramPic_Missing,
+isShapePic_0,
+isShapePic_1,
+isShapePic_Missing,
+contains_youtube_0,
+contains_youtube_1,
+top_creator_quartile_NO,
+top_creator_quartile_YES,
+top10_creators_by_num_projects_NO,
+top10_creators_by_num_projects_YES,
+top10_creators_by_average_goal_NO,
+top10_creators_by_average_goal_YES,
+category_in_top_10_NO,
+category_in_top_10_YES,
+fem_creators_greater_than_male_creators_NO,
+fem_creators_greater_than_male_creators_YES,
+fem_projects_greater_than_male_projects_NO,
+fem_projects_greater_than_male_projects_YES,
+afinn_positive_higher_NO,
+afinn_positive_higher_YES,
+numerical_pred_ridge_blurb
+  )
+```
+
+
+```{r Model Deployment, echo = FALSE}
+base_data2_data_matrix <- as.matrix(sapply(base_data2, as.numeric))
+test_pool <- catboost.load_pool(data = base_data2_data_matrix, label = NULL)
+bst_pred <- catboost.predict(model, test_pool)
+bst_classifications <- ifelse(bst_pred > 0.5, "YES", "NO")
+
+
+write.table(bst_classifications, "success_group5.csv", row.names = FALSE)
+
+# write.table(names(cleans),"test_features.csv",row.names = FALSE)
+```
+
